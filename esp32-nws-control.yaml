@@ -1,0 +1,1559 @@
+substitutions:
+  name: esp32-nws-control
+  friendly_name: esp32-nws-control
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+  project:
+    name: "EBH.NWS-Fan-Controller"
+    version: "1.00"
+  on_boot:
+    priority: 600 # Wichtig: Hoch genug wählen, damit Hardware bereit ist
+    then:
+      - lambda: |-
+          if (id(auto_temp_start) < 20.0f) id(auto_temp_start) = 20.0f;
+          if (id(auto_temp_start) > 30.0f) id(auto_temp_start) = 30.0f;
+          if (id(auto_temp_max) < 25.0f) id(auto_temp_max) = 25.0f;
+          if (id(auto_temp_max) > 50.0f) id(auto_temp_max) = 50.0f;
+          if (id(auto_temp_start) > id(auto_temp_max)) id(auto_temp_start) = id(auto_temp_max);
+          if (id(auto_fan_min) < 20) id(auto_fan_min) = 20;
+          if (id(auto_fan_min) > 80) id(auto_fan_min) = 80;
+          if (id(auto_fan_max) < 30) id(auto_fan_max) = 30;
+          if (id(auto_fan_max) > 100) id(auto_fan_max) = 100;
+          if (id(auto_fan_min) > id(auto_fan_max)) id(auto_fan_min) = id(auto_fan_max);
+          if (id(auto_temp_hysteresis) < 1.0f) id(auto_temp_hysteresis) = 1.0f;
+          if (id(auto_temp_hysteresis) > 5.0f) id(auto_temp_hysteresis) = 5.0f;
+          if (id(fan_mode_store) == 1) {
+            id(fan_mode) = 'a';
+          } else {
+            id(fan_mode) = 'm';
+          }
+      - light.turn_on:
+          id: disp_light
+          brightness: 40%
+
+      - script.execute: sync_fan_ui
+      - script.execute: update_sleep_icon
+
+      - lambda: |-
+          if (id(ha_wartung_state).state) {
+            lv_obj_clear_flag(id(ui_wartung_icon), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_color(id(ui_wartung_icon), lv_color_hex(0xFFA500), 0);
+          } else {
+            lv_obj_add_flag(id(ui_wartung_icon), LV_OBJ_FLAG_HIDDEN);
+          }
+      - script.execute: update_clock_display
+      - script.execute: fan_auto_control
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+# Wichtiger Hinweis zu den Pins:
+# Achte darauf, dass die Pins GPIO33 bis GPIO37 in deinem restlichen Code nicht verwendet werden, 
+# da diese beim ESP32-S3R8 intern fest für die PSRAM-Anbindung reserviert sind.
+psram:
+    mode: octal
+    speed: 80MHz
+
+mdns:
+
+safe_mode:
+
+#http_request:
+
+logger:
+#  level: VERY_VERBOSE
+#  logs:
+#    touchscreen: VERY_VERBOSE # Zeigt jede Berührung im Log an
+api:
+  on_client_connected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - globals.set:
+              id: ha_api_connected
+              value: 'true'
+          - lvgl.widget.show: ui_ha_connected
+          - script.execute: sync_fan_ui
+          - script.execute: update_clock_display
+  on_client_disconnected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - globals.set:
+              id: ha_api_connected
+              value: 'false'
+          - if:
+              condition:
+                lambda: "return id(fan_mode) == 'm';"
+              then:
+                - globals.set:
+                    id: fan_mode
+                    value: "'a'"
+                - globals.set:
+                    id: fan_mode_store
+                    value: '1'
+                - lvgl.widget.hide: ui_ha_connected
+          - script.execute: sync_fan_ui
+          - script.execute: update_clock_display
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+    servers:
+      - pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+
+script:
+  - id: update_clock_display
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(ha_api_connected);"
+          then:
+            - lambda: |-
+                // Home Assistant liefert die Werte direkt über die HA-Textsensoren.
+          else:
+            - if:
+                condition:
+                  lambda: "return id(wifi_connected) && id(sntp_time).now().is_valid();"
+                then:
+                  - lvgl.label.update:
+                      id: ui_time
+                      text: !lambda |-
+                        auto now = id(sntp_time).now();
+                        return str_sprintf("%02d:%02d", now.hour, now.minute);
+                  - lvgl.label.update:
+                      id: ui_date
+                      text: !lambda |-
+                        auto now = id(sntp_time).now();
+                        return str_sprintf("%02d.%02d.%04d", now.day_of_month, now.month, now.year);
+                else:
+                  - lvgl.label.update:
+                      id: ui_time
+                      text: "--:--"
+                  - lvgl.label.update:
+                      id: ui_date
+                      text: "--.--.----"
+
+  - id: sync_fan_ui
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(fan_mode) == 'a';"
+          then:
+            - text_sensor.template.publish:
+                id: fan_mode_text
+                state: "AUTO"
+            - lvgl.widget.disable: ui_fan_speed_slider
+          else:
+            - if:
+                condition:
+                  lambda: "return id(fan_mode) == 'm';"
+                then:
+                  - text_sensor.template.publish:
+                      id: fan_mode_text
+                      state: "MANUELL"
+                  - lvgl.widget.enable: ui_fan_speed_slider
+                else:
+                  - text_sensor.template.publish:
+                      id: fan_mode_text
+                      state: "MANUELL"
+                  - lvgl.widget.disable: ui_fan_speed_slider
+
+      - if:
+          condition:
+            lambda: "return id(fan_mode) == 'a';"
+          then:
+            - lvgl.label.update:
+                id: ui_fan_icon
+                text: "\U000F171D"
+                text_color: 0xFFA500
+            - lvgl.slider.update:
+                id: ui_fan_speed_slider
+                value: !lambda "return (!id(nws_fan).state) ? 0 : (int) id(nws_fan).speed;"
+          else:
+            - if:
+                condition:
+                  lambda: "return (!id(nws_fan).state) || (id(nws_fan).speed <= 0);"
+                then:
+                  - lvgl.label.update:
+                      id: ui_fan_icon
+                      text: "\U000F081D"
+                      text_color: 0xFF0000
+                  - lvgl.slider.update:
+                      id: ui_fan_speed_slider
+                      value: 0
+                else:
+                  - lvgl.label.update:
+                      id: ui_fan_icon
+                      text: "\U000F0210"
+                      text_color: 0xFFFFFF
+                  - lvgl.slider.update:
+                      id: ui_fan_speed_slider
+                      value: !lambda "return (int) id(nws_fan).speed;"
+
+      - lambda: |-
+          lv_obj_t *ticks[] = {
+            id(ui_fan_tick_0), id(ui_fan_tick_1), id(ui_fan_tick_2), id(ui_fan_tick_3), id(ui_fan_tick_4),
+            id(ui_fan_tick_5), id(ui_fan_tick_6), id(ui_fan_tick_7), id(ui_fan_tick_8), id(ui_fan_tick_9),
+            id(ui_fan_tick_10)
+          };
+
+          const int speed = (!id(nws_fan).state) ? 0 : (int) id(nws_fan).speed;
+          const int start_x = 94;
+          const int total_width = 206;
+          const int base_y_major = 179;
+          const int base_y_minor = 183;
+
+          for (int i = 0; i <= 10; i++) {
+            int x = start_x + ((i * total_width) / 10);
+            const bool major = (i == 0 || i == 5 || i == 10);
+            const bool active = speed >= (i * 10);
+
+            int h = major ? (active ? 14 : 10) : (active ? 10 : 6);
+            int w = major ? 3 : 2;
+            int y = (major ? base_y_major : base_y_minor) - (h - (major ? 10 : 6));
+
+            uint32_t color = 0x4A4A4A;
+            if (i == 0) {
+              color = 0xFFFFFF;
+            } else if (i == 5) {
+              color = 0xFFA500;
+            } else if (i == 10) {
+              color = 0xFF0000;
+            } else if (active) {
+              color = 0xA8D8FF;
+            }
+
+            lv_obj_set_x(ticks[i], x - (w / 2));
+            lv_obj_set_size(ticks[i], w, h);
+            lv_obj_set_y(ticks[i], y);
+            lv_obj_set_style_bg_color(ticks[i], lv_color_hex(color), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(ticks[i], LV_OPA_COVER, LV_PART_MAIN);
+          }
+
+  - id: update_sleep_icon
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(sleep_mode_active).state) {
+            lv_obj_clear_flag(id(ui_sleepmode), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_text_color(id(ui_sleepmode), lv_color_hex(0x7AA2FF), 0);
+          } else {
+            lv_obj_add_flag(id(ui_sleepmode), LV_OBJ_FLAG_HIDDEN);
+          }
+
+  - id: fan_auto_control
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(fan_mode) != 'a') {
+            return;
+          }
+
+          float top = id(temp_nw_top).state;
+          float bottom = id(temp_nw_bottom).state;
+
+          if (!isnan(top)) {
+            id(last_valid_top_temp) = top;
+          }
+          if (!isnan(bottom)) {
+            id(last_valid_bottom_temp) = bottom;
+          }
+
+          float control_temp = top;
+          std::string reason = "AUTO";
+
+          if (isnan(control_temp) && !isnan(bottom)) {
+            control_temp = bottom;
+            reason = "FALLBACK UNTEN";
+          } else if (isnan(control_temp) && !isnan(id(last_valid_top_temp))) {
+            control_temp = id(last_valid_top_temp);
+            reason = "FALLBACK LETZT";
+          } else if (isnan(control_temp) && !isnan(id(last_valid_bottom_temp))) {
+            control_temp = id(last_valid_bottom_temp);
+            reason = "FALLBACK UNTEN LETZT";
+          }
+
+          if (!isnan(top) && !isnan(bottom)) {
+            id(fan_delta_temp).publish_state(top - bottom);
+          } else if (!isnan(id(last_valid_top_temp)) && !isnan(id(last_valid_bottom_temp))) {
+            id(fan_delta_temp).publish_state(id(last_valid_top_temp) - id(last_valid_bottom_temp));
+          }
+
+          int desired = 0;
+
+          if (isnan(control_temp)) {
+            desired = id(failsafe_fan_speed);
+            reason = "FAILSAFE SENSOR";
+          } else {
+            const float start = id(auto_temp_start);
+            const float max_t = id(auto_temp_max);
+            const float critical = id(auto_temp_critical);
+            const float hyst = id(auto_temp_hysteresis);
+
+            const int fan_min = id(auto_fan_min);
+            int fan_max = id(auto_fan_max);
+
+            const bool sleep_active = id(sleep_mode_active).state;
+            if (sleep_active) {
+              fan_max = std::min(fan_max, id(night_fan_max));
+            }
+
+            if (control_temp >= critical) {
+              desired = 100;
+              reason = sleep_active ? "KRITISCH NACHT" : "KRITISCH";
+            } else if (control_temp <= (start - hyst)) {
+              desired = 0;
+              reason = sleep_active ? "NACHT AUS" : "AUTO AUS";
+            } else if (control_temp < start) {
+              desired = id(last_auto_speed);
+              if (reason == "AUTO")
+                reason = sleep_active ? "NACHT HALTEN" : "AUTO HALTEN";
+            } else if (control_temp >= max_t) {
+              desired = fan_max;
+              if (reason == "AUTO")
+                reason = sleep_active ? "NACHT MAX" : "AUTO MAX";
+            } else {
+              float ratio = (control_temp - start) / std::max(0.1f, (max_t - start));
+              desired = fan_min + (int) roundf(ratio * (fan_max - fan_min));
+              if (reason == "AUTO")
+                reason = sleep_active ? "AUTO NACHT" : "AUTO TAG";
+            }
+          }
+
+          desired = std::max(0, std::min(100, desired));
+          id(last_auto_speed) = desired;
+          id(fan_target_speed).publish_state(desired);
+          id(fan_control_reason).publish_state(reason);
+
+          const int current = (!id(nws_fan).state) ? 0 : (int) id(nws_fan).speed;
+          if (abs(desired - current) < 2) {
+            return;
+          }
+
+          if (desired <= 0) {
+            auto call = id(nws_fan).turn_off();
+            call.perform();
+          } else {
+            auto call = id(nws_fan).turn_on();
+            call.set_speed(desired);
+            call.perform();
+          }
+
+ota:
+  - platform: esphome
+  - platform: web_server
+
+web_server:
+  auth:
+    username: !secret web_server_username
+    password: !secret web_server_password
+  local: True
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+#  use_address: xxx.xxx.xxx.xxx
+  # Trigger für den WLAN-Status
+  on_connect:
+    then:
+      - globals.set:
+          id: wifi_connected
+          value: 'true'
+      - lvgl.widget.show: ui_wifi_connected  # Zeigt das Widget, wenn WLAN steht
+      - script.execute: update_clock_display
+  on_disconnect:
+    then:
+      - globals.set:
+          id: wifi_connected
+          value: 'false'
+      - globals.set:
+          id: ha_api_connected
+          value: 'false'
+      - if:
+          condition:
+            lambda: "return id(fan_mode) == 'm';"
+          then:
+            - globals.set:
+                id: fan_mode
+                value: "'a'"
+            - lvgl.widget.hide: ui_wifi_connected  # Versteckt es, wenn die Verbindung weg
+      - lvgl.widget.hide: ui_ha_connected
+      - script.execute: sync_fan_ui
+      - script.execute: update_clock_display
+
+  ap:
+    ssid: "${friendly_name} Hotspot"
+    password: !secret apwifi_password
+    ap_timeout: 0s
+
+captive_portal:
+
+interval:
+  - interval: 30s
+    then:
+      - script.execute: update_clock_display
+      - script.execute: fan_auto_control
+
+globals:
+  - id: fan_mode
+    type: char
+    restore_value: false
+    initial_value: "'a'"   # laufender Modus; Restore erfolgt über fan_mode_store
+
+  - id: fan_mode_store
+    type: int
+    restore_value: true
+    initial_value: '1'      # 1=auto, 0=manual
+
+  - id: fan_step
+    type: int
+    initial_value: "5"      # Schrittweite in Prozentpunkten
+
+  - id: manual_speed
+    type: int
+    initial_value: '100'  # Startwert
+
+  - id: auto_temp_start
+    type: float
+    restore_value: true
+    initial_value: '20.0'
+
+  - id: auto_temp_max
+    type: float
+    restore_value: true
+    initial_value: '50.0'
+
+  - id: auto_fan_min
+    type: int
+    restore_value: true
+    initial_value: '10'
+
+  - id: auto_fan_max
+    type: int
+    restore_value: true
+    initial_value: '60'
+
+  - id: auto_temp_critical
+    type: float
+    restore_value: true
+    initial_value: '50.0'
+
+  - id: auto_temp_hysteresis
+    type: float
+    restore_value: true
+    initial_value: '1.0'
+
+  - id: last_auto_speed
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: last_valid_top_temp
+    type: float
+    restore_value: false
+    initial_value: 'NAN'
+
+  - id: last_valid_bottom_temp
+    type: float
+    restore_value: false
+    initial_value: 'NAN'
+
+  - id: failsafe_fan_speed
+    type: int
+    restore_value: true
+    initial_value: '50'
+
+  - id: previous_fan_mode
+    type: char
+    restore_value: true
+    initial_value: "'a'"
+
+  - id: ha_api_connected
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: wifi_connected
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: local_sleep_start_hour
+    type: int
+    restore_value: true
+    initial_value: '22'
+
+  - id: local_sleep_start_minute
+    type: int
+    restore_value: true
+    initial_value: '0'
+
+  - id: local_sleep_end_hour
+    type: int
+    restore_value: true
+    initial_value: '8'
+
+  - id: local_sleep_end_minute
+    type: int
+    restore_value: true
+    initial_value: '0'
+
+  - id: night_fan_max
+    type: int
+    restore_value: true
+    initial_value: '30'
+
+###############################
+# SPI fürs TFT (Waveshare-Pins)
+###############################
+
+spi:
+  - id: spi_tft
+    clk_pin: GPIO39           # dein Display-SCLK
+    mosi_pin: GPIO38          # dein Display-MOSI
+  # MISO ist für dieses Panel nicht erforderlich
+    interface: hardware
+    
+###############################
+# DISPLAY (ST7789V, Custom)
+###############################
+display:
+  - platform: ili9xxx
+    spi_id: spi_tft
+    id: my_display
+    model: ST7789V   # << Hier KEIN "Custom", sondern direkt das Modell
+    dc_pin: GPIO42
+    cs_pin: GPIO45
+    reset_pin: GPIO0
+    rotation: 90
+    dimensions:
+      width: 240
+      height: 320
+    # Wir lassen Offsets erst mal weg, um Ghosting zu vermeiden
+    invert_colors: true
+    update_interval: never
+
+###############################
+# TOUCH – CST816D (I2C + INT)
+###############################
+i2c:
+  sda: GPIO48              # TP SDA
+  scl: GPIO47              # TP SCL
+  frequency: 400kHz
+  scan: true
+
+touchscreen:
+  - platform: cst816
+    id: my_touchscreen
+    display: my_display
+    interrupt_pin: GPIO46
+    # Falls der Klick an der falschen Stelle landet, 
+    # hilft oft das Spiegeln einer Achse:
+    transform:
+      swap_xy: True
+      mirror_y: True
+      mirror_x: False
+
+    calibration:
+      x_min: 16     # aus deinem Log (links)
+      x_max: 313   # aus deinem Log (rechts)
+      y_min: 1     # aus deinem Log (oben)
+      y_max: 227   # aus deinem Log (unten)
+
+###############################
+#   LVGL: Seiten & Widgets
+###############################
+lvgl:
+  touchscreens:
+    - touchscreen_id: my_touchscreen
+  displays: my_display
+  buffer_size: 50%
+  pages:
+    - id: ui_fan_control
+      bg_color: 0x000000
+      border_width: 0
+      scrollbar_mode: "OFF"
+      widgets:
+        - label:
+            id: ui_wartung_icon
+            hidden: true
+            x: 12
+            y: 10
+            width: 20
+            height: 40
+            text: "\U000F1322"
+            text_font: font_mdi_small
+            text_color: 0xFFA500
+            text_align: RIGHT
+
+        - label:
+            id: ui_ha_connected
+            hidden: true
+            x: 32
+            y: 10
+            width: 20
+            height: 40
+            text: "\U000F07D0"
+            text_font: font_mdi_small
+            text_color: 0xFFFFFF
+            text_align: RIGHT
+
+        - label:
+            id: ui_wifi_connected
+            hidden: true
+            x: 52
+            y: 10
+            width: 20
+            height: 40
+            text: "\U000F05A9"
+            text_font: font_mdi_small
+            text_color: 0xFFFFFF
+            text_align: RIGHT
+
+        - label:
+            id: ui_sleepmode
+            hidden: true
+            x: 72
+            y: 10
+            width: 20
+            height: 40
+            text: "\U000F0904"
+            text_font: font_mdi_small
+            text_color: 0xFFFFFF
+            text_align: RIGHT
+
+        - label:
+            id: ui_date
+            x: 100
+            y: 10
+            width: 120
+            height: 40
+            text: "--.--.----"
+            text_align: RIGHT
+            text_font: font_middle
+            text_color: 0xFFFFFF
+
+        - label:
+            id: ui_time
+            x: 220
+            y: 10
+            width: 82
+            height: 40
+            text: "--:--"
+            text_align: RIGHT
+            text_font: font_middle
+            text_color: 0xFFFFFF
+
+        - label:
+            id: ui_temperatur_icon
+            x: 12
+            y: 69
+            width: 64
+            height: 64
+            text: "\U000F050F"
+            text_font: font_mdi_big
+            text_color: 0xFFFFFF
+            text_align: CENTER
+
+        - bar:
+            id: ui_temperatur_bar_top
+            x: 94
+            y: 70
+            width: 206
+            height: 8
+            min_value: 20
+            max_value: 45
+            bg_color: 0x141414
+            indicator:
+              bg_color: 0x0000FF
+              bg_grad_dir: HOR
+              bg_opa: COVER
+
+        - bar:
+            id: ui_temperatur_bar_bottom
+            x: 94
+            y: 122
+            width: 206
+            height: 8
+            min_value: 20
+            max_value: 45
+            bg_color: 0x141414
+            indicator:
+              bg_color: 0x0000FF
+              bg_grad_dir: HOR
+              bg_opa: COVER
+
+        - label:
+            id: ui_status_temperatur_top_icon
+            x: 89
+            y: 83
+            width: 18
+            height: 34
+            text: "\U000F0E03"
+            text_font: font_mdi_middle
+            text_color: 0xFFFFFF
+            text_align: LEFT
+
+        - label:
+            id: ui_status_temperatur_top
+            x: 109
+            y: 83
+            width: 83
+            height: 34
+            text: "--.- °C"
+            text_font: font_middle
+            text_color: 0xFFFFFF
+            text_align: RIGHT
+
+        - label:
+            id: ui_status_temperatur_bottom_icon
+            x: 194
+            y: 83
+            width: 18
+            height: 34
+            text: "\U000F0E02"
+            text_font: font_mdi_middle
+            text_color: 0xFFFFFF
+            text_align: LEFT
+
+        - label:
+            id: ui_status_temperatur_bottom
+            x: 214
+            y: 83
+            width: 83
+            height: 34
+            text: "--.- °C"
+            text_font: font_middle
+            text_color: 0xFFFFFF
+            text_align: RIGHT
+
+        - button:
+            id: ui_fan_mode_button
+            x: 12
+            y: 146
+            width: 64
+            height: 64
+            bg_opa: TRANSP
+            border_width: 0
+            shadow_width: 0
+            press_lock: true
+            widgets:
+              - label:
+                  id: ui_fan_icon
+                  align: CENTER
+                  text: "\U000F171D"
+                  text_font: font_mdi_big
+                  text_color: 0xFFFFFF
+                  text_align: CENTER
+            on_short_click:
+              then:
+                - if:
+                    condition:
+                      lambda: "return id(fan_mode) == 'a';"
+                    then:
+                      - globals.set:
+                          id: fan_mode
+                          value: "'m'"
+                      - globals.set:
+                          id: fan_mode_store
+                          value: '0'
+                      - globals.set:
+                          id: previous_fan_mode
+                          value: "'m'"
+                      - lambda: |-
+                          id(manual_speed) = (!id(nws_fan).state) ? std::max(id(fan_step), id(manual_speed)) : (int) id(nws_fan).speed;
+                    else:
+                      - globals.set:
+                          id: fan_mode
+                          value: "'a'"
+                      - globals.set:
+                          id: fan_mode_store
+                          value: '1'
+                      - globals.set:
+                          id: previous_fan_mode
+                          value: "'a'"
+                - script.execute: sync_fan_ui
+            on_long_press:
+              then:
+                - globals.set:
+                    id: fan_mode
+                    value: "'m'"
+                - globals.set:
+                    id: fan_mode_store
+                    value: '0'
+                - globals.set:
+                    id: previous_fan_mode
+                    value: "'m'"
+                - lambda: |-
+                    id(manual_speed) = 0;
+                - fan.turn_off: nws_fan
+                - script.execute: sync_fan_ui
+
+        - obj:
+            id: ui_fan_slider_glow
+            hidden: true
+            x: 90
+            y: 154
+            width: 214
+            height: 22
+            bg_color: 0x1E90FF
+            bg_opa: 35%
+            border_width: 0
+            radius: 11
+
+        - slider:
+            id: ui_fan_speed_slider
+            x: 94
+            y: 160
+            width: 206
+            height: 10
+            min_value: 0
+            max_value: 100
+            value: 0
+            bg_color: 0x101010
+            indicator:
+              bg_color: 0x1E90FF
+              bg_grad_dir: HOR
+              bg_opa: COVER
+            knob:
+              bg_opa: TRANSP
+              border_width: 0
+              shadow_width: 0
+              pad_all: 0
+            on_press:
+              then:
+                - lvgl.widget.show: ui_fan_slider_glow
+            on_value:
+              then:
+                - if:
+                    condition:
+                      lambda: "return id(fan_mode) == 'm';"
+                    then:
+                      - lambda: |-
+                          lv_obj_t *ticks[] = {
+                            id(ui_fan_tick_0), id(ui_fan_tick_1), id(ui_fan_tick_2), id(ui_fan_tick_3), id(ui_fan_tick_4),
+                            id(ui_fan_tick_5), id(ui_fan_tick_6), id(ui_fan_tick_7), id(ui_fan_tick_8), id(ui_fan_tick_9),
+                            id(ui_fan_tick_10)
+                          };
+
+                          const int speed = (int) x;
+                          const int start_x = 94;
+                          const int total_width = 206;
+                          const int base_y_major = 179;
+                          const int base_y_minor = 183;
+
+                          for (int i = 0; i <= 10; i++) {
+                            int tick_x = start_x + ((i * total_width) / 10);
+                            const bool major = (i == 0 || i == 5 || i == 10);
+                            const bool active = speed >= (i * 10);
+
+                            int h = major ? (active ? 14 : 10) : (active ? 10 : 6);
+                            int w = major ? 3 : 2;
+                            int y = (major ? base_y_major : base_y_minor) - (h - (major ? 10 : 6));
+
+                            uint32_t color = 0x4A4A4A;
+                            if (i == 0) {
+                              color = 0xFFFFFF;
+                            } else if (i == 5) {
+                              color = 0xFFA500;
+                            } else if (i == 10) {
+                              color = 0xFF0000;
+                            } else if (active) {
+                              color = 0xA8D8FF;
+                            }
+
+                            lv_obj_set_x(ticks[i], tick_x - (w / 2));
+                            lv_obj_set_size(ticks[i], w, h);
+                            lv_obj_set_y(ticks[i], y);
+                            lv_obj_set_style_bg_color(ticks[i], lv_color_hex(color), LV_PART_MAIN);
+                            lv_obj_set_style_bg_opa(ticks[i], LV_OPA_COVER, LV_PART_MAIN);
+                          }
+            on_release:
+              then:
+                - lvgl.widget.hide: ui_fan_slider_glow
+                - if:
+                    condition:
+                      lambda: "return id(fan_mode) == 'm';"
+                    then:
+                      - lambda: |-
+                          id(manual_speed) = (int) x;
+                      - if:
+                          condition:
+                            lambda: "return ((int) x) <= 0;"
+                          then:
+                            - fan.turn_off: nws_fan
+                          else:
+                            - fan.turn_on:
+                                id: nws_fan
+                                speed: !lambda "return (int) x;"
+                    else:
+                      - lvgl.slider.update:
+                          id: ui_fan_speed_slider
+                          value: !lambda "return (!id(nws_fan).state) ? 0 : (int) id(nws_fan).speed;"
+                - script.execute: sync_fan_ui
+
+
+        - obj:
+            id: ui_fan_tick_rail
+            x: 94
+            y: 188
+            width: 206
+            height: 1
+            bg_color: 0x1C1C1C
+            bg_opa: COVER
+            border_width: 0
+            radius: 0
+
+        - obj:
+            id: ui_fan_tick_0
+            x: 94
+            y: 179
+            width: 3
+            height: 10
+            bg_color: 0xFFFFFF
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_1
+            x: 115
+            y: 183
+            width: 2
+            height: 6
+            bg_color: 0x4A4A4A
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_2
+            x: 135
+            y: 183
+            width: 2
+            height: 6
+            bg_color: 0x4A4A4A
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_3
+            x: 156
+            y: 183
+            width: 2
+            height: 6
+            bg_color: 0x4A4A4A
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_4
+            x: 176
+            y: 183
+            width: 2
+            height: 6
+            bg_color: 0x4A4A4A
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_5
+            x: 197
+            y: 179
+            width: 3
+            height: 10
+            bg_color: 0xFFA500
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_6
+            x: 218
+            y: 183
+            width: 2
+            height: 6
+            bg_color: 0x4A4A4A
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_7
+            x: 238
+            y: 183
+            width: 2
+            height: 6
+            bg_color: 0x4A4A4A
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_8
+            x: 259
+            y: 183
+            width: 2
+            height: 6
+            bg_color: 0x4A4A4A
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_9
+            x: 279
+            y: 183
+            width: 2
+            height: 6
+            bg_color: 0x4A4A4A
+            border_width: 0
+            radius: 0
+        - obj:
+            id: ui_fan_tick_10
+            x: 300
+            y: 179
+            width: 3
+            height: 10
+            bg_color: 0xFF0000
+            border_width: 0
+            radius: 0
+
+###############################
+#   FONTS
+###############################
+font:
+  - file: "fonts/Roboto-Regular.ttf"
+    id: font_small
+    size: 16
+    glyphs: '!"%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ'
+
+  - file: "fonts/Roboto-Regular.ttf"
+    id: font_middle
+    size: 22
+    glyphs: '!"%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ'
+
+  - file: "fonts/Roboto-Bold.ttf"
+    id: font_big
+    size: 28
+    glyphs: '!"%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ'
+
+  - file: "fonts/Roboto-Bold.ttf"
+    id: font_bigger
+    size: 48
+    glyphs: '!"%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~ ¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ'
+
+  # Material Design Icons (lokale TTF) – NUR die benötigten Glyphen
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: font_mdi_small
+    size: 20          # size MUSS gesetzt sein
+    bpp: 4            # optional, saubere Kantenglättung
+    # MDI: Supplementary PUA -> \U mit 8 Stellen
+    glyphs: &mdi-icons [
+      "\U000F05A9", #mdi:wifi
+      "\U000F05AA", #mdi:wifi-off
+      "\U000F0210", #mdi:fan
+      "\U000F081D", #mdi:fan-off
+      "\U000F146C", #mdi:fan-alert
+      "\U000F171D", #mdi:fan-auto
+      "\U000F146D", #mdi:fan-chevron-down
+      "\U000F146E", #mdi:fan-chevron-up
+      "\U000F050F", #mdi:thermometer
+      "\U000F0E03", #mdi:thermometer-chevron-up
+      "\U000F0E02", #mdi:thermometer-chevron-down
+      "\U000F1322", #mdi:hammer-screwdriver
+      "\U000F07D0", #mdi:home-assistant
+      "\U000F045F", #mdi:restart
+      "\U000F0904", #mdi:power-sleep   
+      ]
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: font_mdi_middle
+    size: 28          # size MUSS gesetzt sein
+    bpp: 4            # optional, saubere Kantenglättung
+    glyphs: *mdi-icons      
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: font_mdi_big
+    size: 40          # size MUSS gesetzt sein
+    bpp: 4            # optional, saubere Kantenglättung
+    glyphs: *mdi-icons
+
+
+###############################
+#   Backlight (PWM)
+###############################
+output:
+  - platform: ledc
+    pin: GPIO1
+    frequency: 25000 Hz    
+    id: lcd_backlight_pwm
+
+  - platform: ledc
+    pin: GPIO18
+    frequency: 25000 Hz
+    id: fan_pwm
+
+light:
+  - platform: monochromatic
+    output: lcd_backlight_pwm
+    name: "Display Helligkeit"
+    id: disp_light
+    restore_mode: ALWAYS_ON
+
+text_sensor:
+  - platform: homeassistant
+    id: ha_time_string
+    entity_id: sensor.time
+    # Jedes Mal, wenn sich der String in HA ändert (jede Minute):
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: "return id(ha_api_connected);"
+            then:
+              - lvgl.label.update:
+                  id: ui_time
+                  text: !lambda 'return x.c_str();'
+  - platform: homeassistant
+    id: ha_date_string
+    entity_id: sensor.date_ger_short_format
+    # Jedes Mal, wenn sich der String in HA ändert (jeden Tag):
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: "return id(ha_api_connected);"
+            then:
+              - lvgl.label.update:
+                  id: ui_date
+                  text: !lambda 'return x.c_str();'
+
+  - platform: template
+    id: fan_mode_text
+    name: "Lüfter Modus"
+    icon: "mdi:fan-auto"
+    update_interval: never
+
+  - platform: template
+    id: fan_control_reason
+    name: "Lüfter Regelgrund"
+    icon: "mdi:information-outline"
+    update_interval: never
+
+button:
+  - platform: restart
+    name: "${friendly_name} neu starten"
+    id: reboot_device
+    entity_category: config
+  - platform: safe_mode
+    name: "${friendly_name} Safe Mode Boot"
+  - platform: factory_reset
+    name: "${friendly_name} Factory Reset"
+
+select:
+  - platform: template
+    id: fan_mode_select
+    name: "Lüfter Modus"
+    icon: "mdi:fan-auto"
+    options:
+      - AUTO
+      - MANUELL
+    lambda: |-
+      return (id(fan_mode) == 'a') ? std::string("AUTO") : std::string("MANUELL");
+    set_action:
+      - if:
+          condition:
+            lambda: 'return x == "AUTO";'
+          then:
+            - globals.set:
+                id: fan_mode
+                value: "'a'"
+            - globals.set:
+                id: fan_mode_store
+                value: '1'
+            - globals.set:
+                id: previous_fan_mode
+                value: "'a'"
+            - script.execute: sync_fan_ui
+            - script.execute: fan_auto_control
+          else:
+            - globals.set:
+                id: fan_mode
+                value: "'m'"
+            - globals.set:
+                id: fan_mode_store
+                value: '0'
+            - globals.set:
+                id: previous_fan_mode
+                value: "'m'"
+            - lambda: |-
+                id(manual_speed) = (!id(nws_fan).state) ? std::max(id(fan_step), id(manual_speed)) : (int) id(nws_fan).speed;
+            - script.execute: sync_fan_ui
+
+datetime:
+  - platform: template
+    id: local_sleep_start_time
+    name: "Schlafmodus Start"
+    type: time
+    optimistic: true
+    restore_value: true
+    initial_value: "22:00:00"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          id(local_sleep_start_hour) = x.hour;
+          id(local_sleep_start_minute) = x.minute;
+
+  - platform: template
+    id: local_sleep_end_time
+    name: "Schlafmodus Ende"
+    type: time
+    optimistic: true
+    restore_value: true
+    initial_value: "08:00:00"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          id(local_sleep_end_hour) = x.hour;
+          id(local_sleep_end_minute) = x.minute;
+
+number:
+  - platform: template
+    id: auto_temp_start_number
+    name: "Auto Temperatur Start"
+    optimistic: true
+    restore_value: true
+    min_value: 20
+    max_value: 30
+    step: 1
+    initial_value: 26
+    mode: slider
+    unit_of_measurement: "°C"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          float v = x;
+          if (v < 20.0f) v = 20.0f;
+          if (v > 30.0f) v = 30.0f;
+          id(auto_temp_start) = v;
+          if (id(auto_temp_max) < v) {
+            id(auto_temp_max) = v;
+            id(auto_temp_max_number).publish_state(v);
+          }
+          id(auto_temp_start_number).publish_state(v);
+
+  - platform: template
+    id: auto_temp_max_number
+    name: "Auto Temperatur Max"
+    optimistic: true
+    restore_value: true
+    min_value: 25
+    max_value: 60
+    step: 1
+    initial_value: 50
+    mode: slider
+    unit_of_measurement: "°C"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          float v = x;
+          if (v < 25.0f) v = 25.0f;
+          if (v > 60.0f) v = 60.0f;
+          id(auto_temp_max) = v;
+          if (id(auto_temp_start) > v) {
+            id(auto_temp_start) = v;
+            id(auto_temp_start_number).publish_state(v);
+          }
+          id(auto_temp_max_number).publish_state(v);
+
+  - platform: template
+    id: auto_fan_min_number
+    name: "Auto Lüfter Minimum"
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 80
+    step: 5
+    initial_value: 10
+    mode: slider
+    unit_of_measurement: "%"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          int v = (int) x;
+          if (v < 10) v = 10;
+          if (v > 80) v = 80;
+          id(auto_fan_min) = v;
+          if (id(auto_fan_max) < v) {
+            id(auto_fan_max) = v;
+            id(auto_fan_max_number).publish_state(v);
+          }
+          id(auto_fan_min_number).publish_state(v);
+
+  - platform: template
+    id: auto_fan_max_number
+    name: "Auto Lüfter Maximum"
+    optimistic: true
+    restore_value: true
+    min_value: 30
+    max_value: 100
+    step: 5
+    initial_value: 60
+    mode: slider
+    unit_of_measurement: "%"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          int v = (int) x;
+          if (v < 30) v = 30;
+          if (v > 100) v = 100;
+          id(auto_fan_max) = v;
+          if (id(auto_fan_min) > v) {
+            id(auto_fan_min) = v;
+            id(auto_fan_min_number).publish_state(v);
+          }
+          id(auto_fan_max_number).publish_state(v);
+
+  - platform: template
+    id: auto_temp_critical_number
+    name: "Auto Temperatur Kritisch"
+    optimistic: true
+    restore_value: true
+    min_value: 30
+    max_value: 70
+    step: 0.5
+    initial_value: 55
+    mode: slider
+    unit_of_measurement: "°C"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          id(auto_temp_critical) = x;
+
+  - platform: template
+    id: auto_temp_hysteresis_number
+    name: "Auto Hysterese"
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 5
+    step: 0.5
+    initial_value: 1.0
+    mode: slider
+    unit_of_measurement: "°C"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          id(auto_temp_hysteresis) = x;
+
+  - platform: template
+    id: night_fan_max_number
+    name: "Nacht Lüfter Maximum"
+    optimistic: true
+    restore_value: true
+    min_value: 20
+    max_value: 80
+    step: 5
+    initial_value: 30
+    mode: slider
+    unit_of_measurement: "%"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          id(night_fan_max) = (int) x;
+
+  - platform: template
+    id: failsafe_fan_speed_number
+    name: "Failsafe Lüfter"
+    optimistic: true
+    restore_value: true
+    min_value: 30
+    max_value: 100
+    step: 5
+    initial_value: 50
+    mode: slider
+    unit_of_measurement: "%"
+    update_interval: never
+    set_action:
+      - lambda: |-
+          id(failsafe_fan_speed) = (int) x;
+
+fan:
+  - platform: speed
+    id: nws_fan
+    output: fan_pwm
+#    icon: 
+    name: "Lüfter"
+    restore_mode: RESTORE_DEFAULT_ON
+    speed_count: 100
+    on_state:
+      then:
+        - script.execute: sync_fan_ui
+
+    on_speed_set:
+      then:
+        - lvgl.slider.update:
+            id: ui_fan_speed_slider
+            value: !lambda "return (int)x;"
+
+        - lvgl.widget.update:
+            id: ui_fan_speed_slider
+            indicator:
+              bg_grad_color: !lambda |-
+                float p = x;
+
+                if (p <= 50.0f) {
+                  uint8_t ratio = (uint8_t)((p / 50.0f) * 255.0f);
+                  return lv_color_mix(lv_color_hex(0x4DD0E1), lv_color_hex(0x1E90FF), ratio);
+                } else {
+                  uint8_t ratio = (uint8_t)(((p - 50.0f) / 50.0f) * 255.0f);
+                  return lv_color_mix(lv_color_hex(0xFFFFFF), lv_color_hex(0x4DD0E1), ratio);
+                }
+
+        - lambda: |-
+            if (id(fan_mode) == 'm') {
+              id(manual_speed) = (int)x;
+            }
+        - script.execute: sync_fan_ui
+one_wire:
+  - platform: gpio
+    pin: GPIO14
+
+sensor:
+  - platform: template
+    id: fan_target_speed
+    name: "Lüfter Sollwert"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: never
+
+  - platform: template
+    id: fan_delta_temp
+    name: "Temperatur Delta"
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: never
+
+  - platform: dallas_temp
+    id: temp_nw_top
+    address: 0x
+    name: "Temperatur oben"
+    update_interval: 60s
+    accuracy_decimals: 1
+    unit_of_measurement: "°C"
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: ui_status_temperatur_top
+            text: !lambda |-
+              return str_sprintf("%.1f °C", x);
+        - lvgl.bar.update:
+            id: ui_temperatur_bar_top
+            value: !lambda |-
+              if (x < 20.0f) return 20;
+              if (x > 45.0f) return 45;
+              return (int)x;
+
+        - lvgl.widget.update:
+            id: ui_temperatur_bar_top
+            indicator:
+              bg_grad_color: !lambda |-
+                float p = x;
+
+                if (p <= 32.5f) {
+                  uint8_t ratio = (uint8_t)(((p - 20.0f) / 12.5f) * 255.0f);
+                  if (p < 20.0f) ratio = 0;
+                  return lv_color_mix(lv_color_hex(0xFFFF00), lv_color_hex(0x0000FF), ratio);
+                } else {
+                  uint8_t ratio = (uint8_t)(((p - 32.5f) / 12.5f) * 255.0f);
+                  if (p > 45.0f) ratio = 255;
+                  return lv_color_mix(lv_color_hex(0xFF0000), lv_color_hex(0xFFFF00), ratio);
+                }
+        - lambda: |-
+            if (!isnan(id(temp_nw_bottom).state)) {
+              id(fan_delta_temp).publish_state(x - id(temp_nw_bottom).state);
+            }
+
+  - platform: dallas_temp
+    id: temp_nw_bottom
+    address: 0x
+    name: "Temperatur unten"
+    update_interval: 60s
+    accuracy_decimals: 1
+    unit_of_measurement: "°C"
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: ui_status_temperatur_bottom
+            text: !lambda |-
+              return str_sprintf("%.1f °C", x);
+        - lvgl.bar.update:
+            id: ui_temperatur_bar_bottom
+            value: !lambda |-
+              if (x < 20.0f) return 20;
+              if (x > 45.0f) return 45;
+              return (int)x;
+
+        - lvgl.widget.update:
+            id: ui_temperatur_bar_bottom
+            indicator:
+              bg_grad_color: !lambda |-
+                float p = x;
+
+                if (p <= 32.5f) {
+                  uint8_t ratio = (uint8_t)(((p - 20.0f) / 12.5f) * 255.0f);
+                  if (p < 20.0f) ratio = 0;
+                  return lv_color_mix(lv_color_hex(0xFFFF00), lv_color_hex(0x0000FF), ratio);
+                } else {
+                  uint8_t ratio = (uint8_t)(((p - 32.5f) / 12.5f) * 255.0f);
+                  if (p > 45.0f) ratio = 255;
+                  return lv_color_mix(lv_color_hex(0xFF0000), lv_color_hex(0xFFFF00), ratio);
+                }
+        - lambda: |-
+            if (!isnan(id(temp_nw_top).state)) {
+              id(fan_delta_temp).publish_state(id(temp_nw_top).state - x);
+            }
+binary_sensor:
+  - platform: homeassistant
+    id: ha_wartung_state
+    entity_id: input_boolean.flur_netzwerkschrank_wartung
+    on_state:
+      then:
+        - lambda: |-
+            if (id(ha_wartung_state).state) {
+              lv_obj_clear_flag(id(ui_wartung_icon), LV_OBJ_FLAG_HIDDEN);
+              lv_obj_set_style_text_color(id(ui_wartung_icon), lv_color_hex(0xFFA500), 0);
+            } else {
+              lv_obj_add_flag(id(ui_wartung_icon), LV_OBJ_FLAG_HIDDEN);
+            }
+
+  - platform: homeassistant
+    id: ha_sleep_state
+    entity_id: input_boolean.allgemein_schlafenszeit
+    internal: true
+
+  - platform: template
+    id: sleep_mode_active
+    name: "Schlafmodus aktiv"
+    lambda: |-
+      if (id(ha_api_connected)) {
+        return id(ha_sleep_state).state;
+      }
+      auto now = id(sntp_time).now();
+      if (!now.is_valid()) {
+        return false;
+      }
+      const int start_minutes = id(local_sleep_start_hour) * 60 + id(local_sleep_start_minute);
+      const int end_minutes = id(local_sleep_end_hour) * 60 + id(local_sleep_end_minute);
+      const int current_minutes = now.hour * 60 + now.minute;
+      if (start_minutes == end_minutes) {
+        return false;
+      }
+      if (start_minutes < end_minutes) {
+        return current_minutes >= start_minutes && current_minutes < end_minutes;
+      }
+      return current_minutes >= start_minutes || current_minutes < end_minutes;
+    on_state:
+      then:
+        - script.execute: update_sleep_icon
